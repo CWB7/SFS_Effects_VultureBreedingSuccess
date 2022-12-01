@@ -1,0 +1,1188 @@
+---
+title: "CV_Models_20210504"
+author: "CWBrink_list"
+date: "07/03/2021"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# The effect of supplementary feeding on Cape Vulture breeding success
+
+Supplementary feeding has become a popular, yet still debated, conservation tool to mitigate Old World vulture declines. This intervention is proposed to support vulture numbers by increasing various demographic parameters but such effects have seldom been verified. I used monitoring data on ten South African Cape Vulture colonies spanning over two decades, to model the relationship between supplementary feeding sites within a 100 or 200 km radius and breeding success. 
+
+The analysis below aims to assess 1) the relationship between breeding success at the colony level and the amount of food provided at nearby SFS, 2) whether SFS in closer proximity to vulture colonies are more beneficial, 3) whether poor management practice of not screening carcasses for Pb-contamination may have negative effects on vulture breeding success, 4) whether estimated poisoning prevalence by commercial farmers in the vicinity of colonies may have negative effects on vulture breeding success. I predict that higher provisioning rates and the proximity of SFS to colonies will increase breeding success and that both higher potential poisoning prevalence and higher potential amounts of Pb contaminated food provisioning will decrease breeding success.
+
+```{r Libraries}
+
+rm(list=ls())
+
+pck <- c("lme4", "tidyverse", "MuMIn", "list", "broom", "caret", "parallel", "PerformanceAnalytics", "readr", "here", "xtable", "effects", "sjPlot", "stargazer", "PerformanceAnalytics", "skimr", "DHARMa", "performance", "glmmTMB", "visreg")
+
+lapply(pck, library, character.only= TRUE)
+
+
+```
+
+```{r Custom functions}
+
+see <- function(x) utils::View(x)
+
+
+overdisp_fun <- function(model) {
+    rdf <- df.residual(model)
+    rp <- residuals(model,type="pearson")
+    Pearson.chisq <- sum(rp^2)
+    prat <- Pearson.chisq/rdf
+    pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+    c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+ # Function found at https://bbolker.github.io/mixedmodels-misc/glmmFAQ.html (made by Ben Bolker)
+
+```
+
+```{r Data import}
+
+options(scipen=999)
+library(here)
+bsdat.cv <- read_csv(here::here("Outputs", "Data_output", "BreedingSuccess_CV_PI_20210131.csv"))
+bsdat.cv <- as.data.frame(bsdat.cv)
+bsdat.cv <- bsdat.cv %>% filter(Pairs1 > 4) %>% filter(colony != "Blouberg") %>% filter(Origin != "Pat Benson")
+
+```
+
+# dates
+
+```{r dates}
+
+class(bsdat.cv$survey1)
+library(lubridate)
+summary(yday(bsdat.cv$survey1))
+
+bsdat.cv %>% 
+  mutate(month = month(survey1, label = TRUE)) %>% 
+  ggplot() +
+  geom_bar(aes(x = month), fill = "navy", color = "gold")
+
+
+# Differences in VulPro timing
+bsdat.cv %>% 
+  filter(colony != "Mzimkhulu/Oribi") %>% 
+  filter(colony != "Potberg") %>% 
+  mutate(month = month(survey1, label = TRUE)) %>% 
+  ggplot() +
+  geom_bar(aes(x = month), fill = "navy", color = "gold")
+
+bsdat.cv %>% 
+  filter(colony != "Mzimkhulu/Oribi") %>% 
+  filter(colony != "Potberg") %>% 
+  mutate(dayy = yday(survey1)) %>% 
+  ggplot() +
+  geom_bar(aes(x = dayy), fill = "navy", color = "gold")
+
+#difference in timing in relation to average laying date
+
+bsdat.cv %>% 
+  filter(colony != "Mzimkhulu/Oribi") %>% 
+  filter(colony != "Potberg") %>% 
+  mutate(LDdayy = yday(survey1)-yday(Avg_layingDate)) %>% 
+  ggplot() +
+  geom_bar(aes(x = LDdayy), fill = "navy", color = "gold")
+
+timing_differences <- bsdat.cv %>% 
+  filter(colony != "Mzimkhulu/Oribi") %>% 
+  filter(colony != "Potberg") %>% 
+  mutate(LDdayy_1 = yday(survey1)-yday(Avg_layingDate))
+
+timing_differences <- timing_differences %>% 
+  mutate(LDdayy_2 = yday(survey2)-yday(Avg_layingDate))
+
+summary(timing_differences$LDdayy_1)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# -19.00   10.25   19.00   21.60   30.75   73.00 
+StdDev(timing_differences$LDdayy_1)
+sd(timing_differences$LDdayy_1)
+
+summary(timing_differences$LDdayy_2)
+  # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  #  73.0   105.8   139.5   130.3   151.0   172.0
+sd(timing_differences$LDdayy_2)
+
+summary(bsdat.cv$Days_between_surveys)
+  #  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  # 46.00   97.75  108.00  107.98  127.50  169.00 
+
+summary(timing_differences$Days_between_surveys)
+ # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+ #  46.00   83.25  118.00  108.71  133.00  157.00 
+
+#differences in observation period
+bsdat.cv %>% 
+  filter(colony != "Mzimkhulu/Oribi") %>% 
+  filter(colony != "Potberg") %>% 
+  filter(! year < 2000) %>% 
+  mutate(ObsPer = yday(survey2) - yday(survey1)) %>% 
+  ggplot() +
+  geom_bar(aes(x = ObsPer), fill = "navy", color = "gold")
+
+
+
+```
+
+
+# Cape Vulture 
+
+```{r Scaling}
+bsdat.cv$S_SamllB_PI <- scale(bsdat.cv$SamllB_PI)
+bsdat.cv$S_BigB_PI <- scale(bsdat.cv$BigB_PI)
+bsdat.cv$S_SamllB_Total_kg_y <- scale(bsdat.cv$SamllB_Total_kg_y)
+bsdat.cv$S_BigB_Total_kg_y <- scale(bsdat.cv$BigB_Total_kg_y)
+bsdat.cv$S_SamllB_AvgPoison <- scale(bsdat.cv$SamllB_AvgPoison)
+bsdat.cv$S_BigB_AvgPoison <- scale(bsdat.cv$BigB_AvgPoison)
+bsdat.cv$S_SamllB_Drugs_foodkgy <- scale(bsdat.cv$SamllB_Drugs_foodkgy)
+bsdat.cv$S_BigB_Drugs_foodkgy <- scale(bsdat.cv$BigB_Drugs_foodkgy)
+bsdat.cv$S_SamllB_Lead_foodkgy <- scale(bsdat.cv$SamllB_Lead_foodkgy)
+bsdat.cv$S_BigB_Lead_foodkgy <- scale(bsdat.cv$BigB_Lead_foodkgy)
+bsdat.cv$S_LayDate_survey2 <- scale(bsdat.cv$LayDate_survey2)
+bsdat.cv$S_ObservationPeriod <- scale(bsdat.cv$Days_between_surveys)
+bsdat.cv$S_SamllB_DistI <- scale(bsdat.cv$SamllB_DistI)
+bsdat.cv$S_BigB_DistI <- scale(bsdat.cv$BigB_DistI)
+
+bsdat.cv$LS_SamllB_PI <- scale(log(bsdat.cv$SamllB_PI+1))
+bsdat.cv$LS_BigB_PI <- scale(log(bsdat.cv$BigB_PI+1))
+bsdat.cv$LS_SamllB_Total_kg_y <- scale(log(bsdat.cv$SamllB_Total_kg_y+1))
+bsdat.cv$LS_BigB_Total_kg_y <- scale(log(bsdat.cv$BigB_Total_kg_y+1))
+bsdat.cv$LS_SamllB_AvgPoison <- scale(log(bsdat.cv$SamllB_AvgPoison+1))
+bsdat.cv$LS_BigB_AvgPoison <- scale(log(bsdat.cv$BigB_AvgPoison+1))
+bsdat.cv$LS_SamllB_Drugs_foodkgy <- scale(log(bsdat.cv$SamllB_Drugs_foodkgy+1))
+bsdat.cv$LS_BigB_Drugs_foodkgy <- scale(log(bsdat.cv$BigB_Drugs_foodkgy+1))
+bsdat.cv$LS_SamllB_Lead_foodkgy <- scale(log(bsdat.cv$SamllB_Lead_foodkgy+1))
+bsdat.cv$LS_BigB_Lead_foodkgy <- scale(log(bsdat.cv$BigB_Lead_foodkgy+1))
+bsdat.cv$LS_LayDate_survey2 <- scale(log(bsdat.cv$LayDate_survey2+1))
+bsdat.cv$LS_ObservationPeriod <- scale(log(bsdat.cv$Days_between_surveys+1))
+bsdat.cv$LS_SamllB_DistI <- scale(log(bsdat.cv$SamllB_DistI+1))
+bsdat.cv$LS_BigB_DistI <- scale(log(bsdat.cv$BigB_DistI+1))
+
+write.csv(bsdat.cv, here::here("Outputs", "Data_output", "BreedingSuccess_CV_PI_20210131_scaled.csv"))
+bsdat.cv <- read_csv(here::here("Outputs", "Data_output", "BreedingSuccess_CV_PI_20210131_scaled.csv"))
+# bsdat.cv <-  bsdat.cv %>% mutate(BSmid = success/Pairs1)
+# bsdat.cv <-  bsdat.cv %>% mutate(BSlate = success_late3/Pairs1)
+
+bsdat.cv20 <- subset(bsdat.cv,year > 2000)
+
+bsdat.cv10 <- subset(bsdat.cv,year > 2010)
+
+bsdat.cv5 <- subset(bsdat.cv,year > 2015)
+
+
+# Remove_ouliers
+# bsdat.cv20.no <- bsdat.cv20 %>% filter(., conca != "MOL2016", conca != "NOO2011")
+# 
+# bsdat.cv10.no <- bsdat.cv10 %>% filter(., conca != "MOL2016", conca != "NOO2011")
+# 
+# bsdat.cv5.no <- bsdat.cv5 %>% filter(., conca != "MOL2016", conca != "NOO2011")
+
+x <- arrange(bsdat.cv, BigB_Total_kg_y)
+
+```
+
+
+# Data expl
+
+```{r Data exploration}
+
+#hist(bsdat.cv$success/bsdat.cv$Pairs1)
+#hist(bsdat.cv$success_late3/bsdat.cv$Pairs1)
+
+hist(bsdat.cv$year)
+hist(bsdat.cv$Pairs1) # colonies with 10 pairs same importance as ones with 800 pairs (does scale difference makes sense in model?)
+hist(bsdat.cv$SamllB_SFS_number) 
+hist(bsdat.cv$SamllB_PI) #outliers
+hist(bsdat.cv$SamllB_Total_kg_y)
+hist(bsdat.cv$SamllB_AvgPoison)
+hist(bsdat.cv$SamllB_Lead_foodkgy)
+hist(bsdat.cv$SamllB_Drugs_foodkgy)
+
+hist(bsdat.cv$BigB_SFS_number)
+hist(bsdat.cv$BigB_PI)
+hist(bsdat.cv$BigB_Total_kg_y)
+hist(bsdat.cv$BigB_AvgPoison)
+hist(bsdat.cv$BigB_Lead_foodkgy)
+hist(bsdat.cv$BigB_Drugs_foodkgy)
+
+table(bsdat.cv$colony)
+table(bsdat.cv$year)
+
+# breeding success is generally higher for the mid estimates than for the late estimates
+
+cex.lab <- 2; cex.axis <- 1.5
+par(mar=c(5,5,1,2))
+pairs(~ SamllB_PI + SamllB_Total_kg_y + SamllB_Lead_foodkgy + SamllB_Drugs_foodkgy + SamllB_AvgPoison + BS, data = bsdat.cv, cex.axis=cex.axis, cexx.lab=cex.lab)
+
+pairs(~ BigB_PI + BigB_Total_kg_y + BigB_Lead_foodkgy + BigB_Drugs_foodkgy + BigB_AvgPoison + BS, data = bsdat.cv, cex.axis=cex.axis, cexx.lab=cex.lab)
+
+#
+
+skimr::skim(bsdat.cv)
+
+y <- c(1983:2020)
+
+col.sum <- bsdat.cv %>% group_by(colony) %>% summarize(number_of_years = n())
+y.sum <- bsdat.cv %>% group_by(year) %>% summarize(number_of_colonies = n())
+
+col.sum.m <- bsdat.cv %>% filter(!is.na(success)) %>% group_by(colony) %>% summarize(Mid_number_of_years = n())
+y.sum.m <- bsdat.cv %>% filter(!is.na(success)) %>% group_by(year) %>% summarize(Mid_number_of_colonies = n())
+
+col.sum.l <- bsdat.cv %>% filter(!is.na(success_late3))%>% group_by(colony) %>% summarize(Late_number_of_years = n())
+y.sum.l <- bsdat.cv %>% filter(!is.na(success_late3))%>% group_by(year) %>% summarize(Late_number_of_colonies = n())
+
+colony.sum <-  left_join(col.sum, col.sum.m, by = "colony") 
+colony.sum <- left_join(colony.sum, col.sum.l, by = "colony") 
+
+year.sum <-  left_join(y.sum, y.sum.m, by = "year") 
+year.sum <- left_join(year.sum, y.sum.l, by = "year") 
+
+write.csv(colony.sum, file = here::here("Outputs", "Tables_output", "Colony_summary.csv"))
+write.csv(year.sum, file = here::here("Outputs", "Tables_output", "Year_summary.csv"))
+
+# colony data
+
+bsdat.cv %>% filter(., colony == "Nooitgedacht") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Skeerpoort") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Roberts' Farm") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Manutsa") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Kransberg") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Mannyelanong") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Moletjie") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Soutpansberg") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Potberg") %>% select(., Pairs1, BS) %>% summary()
+bsdat.cv %>% filter(., colony == "Mzimkhulu/Oribi") %>% select(., Pairs1, BS) %>% summary()
+a <- bsdat.cv %>% filter(., BS == 1)
+
+#years
+bsdat.cv %>% filter(., colony == "Nooitgedacht") %>% select(., year) %>% unique()
+bsdat.cv %>% filter(., colony == "Skeerpoort") %>% select(., year) %>% unique()
+bsdat.cv %>% filter(., colony == "Roberts' Farm") %>% select(., year) %>% unique()
+bsdat.cv %>% filter(., colony == "Manutsa") %>% select(., year) %>% unique()
+a <- bsdat.cv %>% filter(., colony == "Kransberg") %>% select(., year) %>% unique() 
+bsdat.cv %>% filter(., colony == "Mannyelanong") %>% select(., year) %>% unique()
+bsdat.cv %>% filter(., colony == "Moletjie") %>% select(., year) %>% unique()
+bsdat.cv %>% filter(., colony == "Soutpansberg") %>% select(., year) %>% unique()
+b <- bsdat.cv %>% filter(., colony == "Potberg") %>% select(., year) %>% unique()
+c <- bsdat.cv %>% filter(., colony == "Mzimkhulu/Oribi") %>% select(., year) %>% unique()
+
+# SFS
+
+bsdat.cv %>% filter(., colony == "Nooitgedacht") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Skeerpoort") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Roberts' Farm") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Manutsa") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Kransberg") %>% filter(., year > 2000) %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Mannyelanong") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Moletjie") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Soutpansberg") %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Potberg") %>% filter(., year > 2000)%>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+bsdat.cv %>% filter(., colony == "Mzimkhulu/Oribi") %>% filter(., year > 2000) %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y) %>% summary()
+
+bsdat.cv %>% select(., SamllB_SFS_number, BigB_SFS_number, SamllB_Total_kg_y, BigB_Total_kg_y, SamllB_AvgPoison, BigB_AvgPoison) %>% summary()
+
+
+```
+
+```{r}
+count(bsdat.cv10, year)
+count(bsdat.cv5, year)
+q <- count(bsdat.cv20, year)
+
+
+count(bsdat.cv10, colony)
+count(bsdat.cv20, colony)
+count(bsdat.cv5, colony)
+q <- count(bsdat.cv20, year)
+
+```
+
+# Investigate outliers
+Nooitgedacht 2011 $ Moletjie 2016
+
+```{r}
+
+n <- bsdat.cv10 %>% filter(., conca == "NOO2011")
+m <- bsdat.cv10 %>% filter(., conca == "MOL2016")
+
+a <- bsdat.cv10 %>% filter(., conca != "MOL2016", conca != "NOO2011", colony != "Potberg")
+
+# BS
+summary(a$BS)
+n$BS
+m$BS
+
+summary(a$BS)
+n$success
+n$fail
+
+m$success
+m$fail
+
+# Laydate
+
+summary(a$LayDate_survey2)
+n$LayDate_survey2
+m$LayDate_survey2
+
+# Total_kg
+
+summary(a$SamllB_Total_kg_y)
+n$SamllB_Total_kg_y
+m$SamllB_Total_kg_y
+
+# AvgPoison
+
+summary(a$SamllB_AvgPoison)
+n$SamllB_AvgPoison
+m$SamllB_AvgPoison
+
+# Lead
+
+summary(a$SamllB_Lead_foodkgy)
+n$SamllB_Lead_foodkgy
+m$SamllB_Lead_foodkgy
+
+# Distance
+
+summary(a$SamllB_DistI)
+n$SamllB_DistI
+m$SamllB_DistI
+
+
+```
+
+# CV 10 years
+
+```{r 10y data exploration}
+bsdat.cv10.m <- bsdat.cv10 %>% 
+  filter(., !is.na(success)) %>% 
+  select(-Distance_toColony)
+```
+
+```{r}
+# variation in breeding success over years and colonies
+ggplot(bsdat.cv10.m,aes(x=year,y=BS))+
+stat_summary(fun.data=mean_cl_boot,size=2)+
+ylim(c(0,1))
+
+ggplot(bsdat.cv10.m,aes(x=colony,y=BS))+
+stat_summary(fun.data=mean_cl_boot,size=2)+
+ylim(c(0,1)) 
+
+# Testing normality in repsonse:
+qqPlot(bsdat.cv10.m$BS)
+shapiro.test(bsdat.cv10.m$BS) # p<0.05 thus data is significantly different from Gausian (normal) distribution.
+
+
+```
+
+```{r 10y correlations etc}
+
+hist(table(bsdat.cv10.m$year))
+hist(table(bsdat.cv10.m$colony), breaks = 10) 
+
+# correlations
+
+bsdat.cv10.m %>% dplyr::select(c(LS_SamllB_PI, LS_SamllB_Total_kg_y, LS_SamllB_Lead_foodkgy, LS_SamllB_Drugs_foodkgy, LS_SamllB_AvgPoison, LS_SamllB_DistI, LS_LayDate_survey2, LS_ObservationPeriod)) %>% 
+  chart.Correlation(., histogram = FALSE, pch=19, cex = 20)
+
+
+bsdat.cv10.m %>% dplyr::select(c(LS_BigB_PI, LS_BigB_Total_kg_y, LS_BigB_Lead_foodkgy, LS_BigB_Drugs_foodkgy, LS_BigB_AvgPoison, LS_BigB_DistI, LS_LayDate_survey2, LS_ObservationPeriod)) %>%  chart.Correlation(., histogram = FALSE, pch=19, cex = 4)
+
+
+#plots
+
+plot(bsdat.cv10.m$BS~bsdat.cv10.m$SamllB_Total_kg_y)
+plot(bsdat.cv10.m$BS~bsdat.cv10.m$LayDate_survey2)
+
+#Breeding success most closely correlated to days from average laying date? This may indicate that any further assesment is irrelevent.
+```
+
+```{r 10y model}
+
+#Global model
+
+# bsdat.cv10.m <- bsdat.cv10.m %>% filter(., BS < 1)
+
+# 100km
+
+M.cv10.100.g.di <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_SamllB_Lead_foodkgy + LS_SamllB_AvgPoison + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv10.m, family=binomial)
+
+summary(M.cv10.100.g.di)
+check_model(M.cv10.100.g.di)
+
+resid.plot <- plot(M.cv10.100.g.di)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv10.100.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv10.100.g.di,
+                  axis.labels=c("Observation period", "Lead contamination risk", "Distance index", "Poisoning prevalence", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv10_100.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv10.100.g.di,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Lead contamination risk","Poisoning prevalence", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv10_100.html"))
+
+
+# Effects plots
+
+##ProvR
+effects_ProvisioninR <- effects::effect(term= "LS_SamllB_Total_kg_y", mod= M.cv10.100.g.di)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv10.m, aes(LS_SamllB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_SamllB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv10_100.tiff", path = here::here("Outputs", "Figure_output"))
+
+## Laydate
+effects_LayD <- effects::effect(term= "LS_ObservationPeriod", mod= M.cv10.100.g.di)
+summary(effects_LayD) #output of what the values are (is this appropriate for non-linear models?)
+x_LayD <- as.data.frame(effects_LayD)
+
+LayD_plot <- ggplot() +
+geom_point(data=bsdat.cv10.m, aes(LS_ObservationPeriod , BS)) +
+geom_point(data=x_LayD, aes(x=LS_ObservationPeriod, y=fit), color="blue") +
+geom_line(data=x_LayD, aes(x=LS_ObservationPeriod, y=fit), color="blue") +
+geom_ribbon(data= x_LayD, aes(x=LS_ObservationPeriod, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Time between average lay date and final survey", y="Breeding success")
+LayD_plot
+ggsave("BensonRemove_ObsPer_SurveyTiming_effect_cv10_100.tiff", path = here::here("Outputs", "Figure_output"))
+
+#######################################################################
+# 200km
+# correlation
+bsdat.cv10.m %>% dplyr::select(c(LS_BigB_PI, LS_BigB_Total_kg_y, LS_BigB_Lead_foodkgy, LS_BigB_Drugs_foodkgy, LS_BigB_AvgPoison, LS_BigB_DistI, LS_ObservationPeriod)) %>%  chart.Correlation(., histogram = FALSE, pch=19, cex = 4)
+
+# Model
+M.cv10.200.g.di  <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_BigB_AvgPoison + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv10.m, family=binomial)
+summary(M.cv10.200.g.di)
+plot(M.cv10.200.g.di)
+check_model(M.cv10.200.g.di)
+
+resid.plot <- plot(M.cv10.200.g.di)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv10.200.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv10.200.g.di,
+                  axis.labels=c("Observation period", "Distance index", "Poisoning prevalence", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv10_200.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv10.200.g.di,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Poisoning prevalence", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv10_200.html"))
+
+
+# Effects plots
+
+##ProvR
+effects_ProvisioninR <- effects::effect(term= "LS_BigB_Total_kg_y", mod= M.cv10.200.g.di)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv10.m, aes(LS_BigB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_BigB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv10_200.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+```
+
+# CV 5 years
+
+```{r CV 5y}
+bsdat.cv5.m <- bsdat.cv5 %>% 
+  filter(., !is.na(success)) %>% 
+  select(-Distance_toColony)
+
+hist(table(bsdat.cv5.m$year)) # Can use year but will have to exclude 2020
+hist(table(bsdat.cv5.m$colony), breaks = 10) # Doubtfful, will have to exclude MAN and SOU
+
+# correlations
+bsdat.cv5.m %>% dplyr::select(c(LS_SamllB_PI, LS_SamllB_Total_kg_y, LS_SamllB_Lead_foodkgy, LS_SamllB_Drugs_foodkgy, LS_SamllB_AvgPoison, LS_SamllB_DistI, LS_ObservationPeriod)) %>% 
+  chart.Correlation(., histogram = FALSE, pch=19, cex = 20)
+
+bsdat.cv5.m %>% dplyr::select(c(LS_BigB_PI, LS_BigB_Total_kg_y, LS_BigB_Lead_foodkgy, LS_BigB_Drugs_foodkgy, LS_BigB_AvgPoison, LS_BigB_DistI, LS_ObservationPeriod)) %>%  chart.Correlation(., histogram = FALSE, pch=19, cex = 4)
+
+
+#Global model
+#100km
+
+M.cv5.100.g <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_SamllB_Lead_foodkgy + LS_SamllB_AvgPoison + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv5.m, family=binomial)
+summary(M.cv5.100.g)
+
+check_model(M.cv5.100.g)
+
+Anova(M.cv5.100.g, type="III")
+plot(allEffects(M.cv5.100.g), xlab="Proximity", ylab="Breeding success", main=NA, ylim=c(-2.2,2))
+
+resid.plot <- plot(M.cv5.100.g)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv5.100.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv5.100.g,
+                   axis.labels=c("Observation period", "Poisoning prevalence", "Lead contamination risk", "Provisioning rate", "Distance index"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE, 
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv5_100.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv5.100.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Lead contamination risk","Poisoning prevalence", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv5_100.html"))
+
+# # Effects plots
+# 
+# ##ProvR
+# effects_ProvisioninR <- effects::effect(term= "LS_SamllB_Total_kg_y", mod= M.cv10.100.g.di)
+# summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+# x_ProvR <- as.data.frame(effects_ProvisioninR)
+# 
+# 
+# library(ggplot2)
+# ProvR_plot <- ggplot() +
+# geom_point(data=bsdat.cv10.m, aes(LS_SamllB_Total_kg_y, BS)) +
+# geom_point(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+# geom_line(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+# geom_ribbon(data= x_ProvR, aes(x=LS_SamllB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+# labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+# ProvR_plot
+# ggsave("ProvR_effect_cv10_100.tiff", path = here("Outputs", "Figure_output"))
+# 
+# 
+# ## Laydate
+# effects_LayD <- effects::effect(term= "LS_ObservationPeriod", mod= M.cv10.100.g.di)
+# summary(effects_LayD) #output of what the values are (is this appropriate for non-linear models?)
+# x_LayD <- as.data.frame(effects_LayD)
+# 
+# LayD_plot <- ggplot() +
+# geom_point(data=bsdat.cv10.m, aes(LS_ObservationPeriod , BS)) +
+# geom_point(data=x_LayD, aes(x=LS_ObservationPeriod, y=fit), color="blue") +
+# geom_line(data=x_LayD, aes(x=LS_ObservationPeriod, y=fit), color="blue") +
+# geom_ribbon(data= x_LayD, aes(x=LS_ObservationPeriod, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+# labs(x="Time between average lay date and final survey", y="Breeding success")
+# LayD_plot
+# ggsave("SurveyTiming_effect_cv10_100.tiff", path = here("Outputs", "Figure_output"))
+#       
+#       
+      
+      
+      
+#200km
+      
+M.cv5.200.g <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv5.m, family=binomial)
+summary(M.cv5.200.g)
+
+check_model(M.cv5.200.g)
+
+Anova(M.cv5.200.g, type="III")
+plot(allEffects(M.cv5.200.g), xlab="Proximity", ylab="Breeding success", main=NA, ylim=c(-2.2,2))
+
+resid.plot <- plot(M.cv5.200.g)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv5.200.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv5.200.g,
+                   axis.labels=c("Observation period", "Provisioning rate", "Distance index"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv5_200.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv5.200.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv5_200.html"))
+
+
+```
+
+
+
+
+# CV 20 years
+
+```{r CV 20y}
+bsdat.cv20.m <- bsdat.cv20 %>% 
+  filter(., !is.na(success)) %>% 
+  select(-Distance_toColony)
+
+hist(table(bsdat.cv10.m$year)) # Debateable (can just exclude 2020)
+hist(table(bsdat.cv10.m$colony), breaks = 10) # doubtful that I can use colony as random effect, will have to exclude MAN and ROB
+
+# correlations
+
+bsdat.cv20.m %>% dplyr::select(c(LS_SamllB_PI, LS_SamllB_Total_kg_y, LS_SamllB_Lead_foodkgy, LS_SamllB_Drugs_foodkgy, LS_SamllB_AvgPoison, LS_SamllB_DistI, LS_ObservationPeriod)) %>%
+  chart.Correlation(., histogram = FALSE, pch=19, cex = 20) # Correlation issue with lead
+
+bsdat.cv20.m %>% dplyr::select(c(LS_BigB_PI, LS_BigB_Total_kg_y, LS_BigB_Lead_foodkgy, LS_BigB_Drugs_foodkgy, LS_BigB_AvgPoison, LS_BigB_DistI, LS_ObservationPeriod)) %>%
+  chart.Correlation(., histogram = FALSE, pch=19, cex = 20)
+
+# Global model
+# 100km
+M.cv20.100.g <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_SamllB_AvgPoison + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv20.m, family=binomial)
+summary(M.cv20.100.g)
+
+Anova(M.cv20.100.g, type="III")
+plot(allEffects(M.cv20.100.g), xlab="Proximity", ylab="Breeding success", main=NA, ylim=c(-2.2,2))
+
+
+resid.plot <- plot(M.cv20.100.g)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv20.100.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv20.100.g,
+                axis.labels=c("Observation period", "Distance index", "Poisoning prevalence", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv20_100.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv20.100.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Poisoning prevalence", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv20_100.html"))
+      
+
+# 200km
+# correlations
+
+bsdat.cv20.m %>% dplyr::select(c(LS_BigB_PI, LS_BigB_Total_kg_y, LS_BigB_Lead_foodkgy, LS_BigB_Drugs_foodkgy, LS_BigB_AvgPoison, LS_BigB_DistI, LS_ObservationPeriod)) %>%  chart.Correlation(., histogram = FALSE, pch=19, cex = 4)
+# model
+M.cv20.200.g <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_BigB_AvgPoison + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv20.m, family=binomial)
+summary(M.cv20.200.g)
+Anova(M.cv20.200.g, type="III")
+plot(allEffects(M.cv20.200.g), xlab="Proximity", ylab="Breeding success", main=NA, ylim=c(-2.2,2))
+
+
+resid.plot <- plot(M.cv20.200.g)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv20.200.g.di.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv20.200.g,
+                  axis.labels=c("Observation period", "Distance index", "Poisoning prevalence", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv20_200.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv20.200.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Poisoning prevalence", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv20_200.html"))
+
+
+```
+
+Model result summaries coalated:
+
+```{r Model result summaries}
+
+#100 km
+
+sjPlot::tab_model(M.cv20.100.g, M.cv10.100.g.di, M.cv5.100.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+                 pred.labels =c("(Intercept)", "Distance index", "Provisioning rate","Poisoning prevalence","Lead contamination risk", "Observation period"),
+                  dv.labels= "Effects of supplementary feeding sites in 100 km buffer on vulture breeding success",
+                  file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_summary_100.html")
+                  )
+
+#200 km
+
+sjPlot::tab_model(M.cv20.200.g, M.cv10.200.g.di, M.cv5.200.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+                 pred.labels =c("(Intercept)", "Distance index", "Provisioning rate","Poisoning prevalence", "Observation period"),
+                  dv.labels= "Effects of supplementary feeding sites in 200 km buffer on vulture breeding success",
+                  file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_summary_200.html")
+                  )
+
+```
+
+
+############################################################################################################################################
+
+# Simple models
+
+```{r 10y model}
+
+#Global model
+
+# bsdat.cv10.m <- bsdat.cv10.m %>% filter(., BS < 1)
+
+# 100km
+
+M.cv10.100.s <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv10.m, family=binomial)
+
+summary(M.cv10.100.s)
+
+resid.plot <- plot(M.cv10.100.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv10.100.s.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+plot(M.cv10.100.s, id=0.05, idLabels=~.obs)
+
+ # Effects size plots:
+
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv10.100.s,
+                   axis.labels=c("Observation period", "Distance index", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv10_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv10.100.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv10_100_s.html"))
+
+
+# Effects plots
+
+##ProvR
+effects_ProvisioninR <- effects::effect(term= "LS_SamllB_Total_kg_y", mod= M.cv10.100.s)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv10.m, aes(LS_SamllB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_SamllB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv10_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+#######################################################################
+# 200km
+
+# Model
+M.cv10.200.s  <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv10.m, family=binomial)
+summary(M.cv10.200.s)
+plot(M.cv10.200.s)
+check_model(M.cv10.200.s)
+
+resid.plot <- plot(M.cv10.200.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv10.200_s.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+
+ # Effects size plots:
+sjPlot::plot_model(M.cv10.200.s,
+                  axis.labels=c("Observation period", "Distance index", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv10_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv10.200.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv10_200_s.html"))
+
+
+# Effects plots
+
+##ProvR
+effects_ProvisioninR <- effects::effect(term= "LS_BigB_Total_kg_y", mod= M.cv10.200.s)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv10.m, aes(LS_BigB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_BigB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv10_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+```
+
+
+# CV 5 years
+
+```{r CV 5y simple}
+
+#Simple model
+#100km
+
+M.cv5.100.s <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv5.m, family=binomial)
+summary(M.cv5.100.s)
+
+check_model(M.cv5.100.s)
+
+resid.plot <- plot(M.cv5.100.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv5.100_s.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+plot(M.cv5.100.s, id=0.05, idLabels=~.obs)
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv5.100.s,
+                 axis.labels=c("Observation period", "Provisioning rate", "Distance index"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE, 
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv5_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+# Tables:
+
+sjPlot::tab_model(M.cv5.100.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv5_100_s.html"))
+
+
+ # Effects plots
+
+##ProvR
+ effects_ProvisioninR <- effects::effect(term= "LS_SamllB_Total_kg_y", mod= M.cv5.100.s)
+ summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+ x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+ ProvR_plot <- ggplot() +
+ geom_point(data=bsdat.cv5.m, aes(LS_SamllB_Total_kg_y, BS)) +
+ geom_point(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+ geom_line(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+ geom_ribbon(data= x_ProvR, aes(x=LS_SamllB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+ labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ ProvR_plot
+ ggsave("BensonRemove_ObsPer_ProvR_effect_cv5_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+      
+      
+#200km
+      
+M.cv5.200.s <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv5.m, family=binomial)
+summary(M.cv5.200.s)
+
+check_model(M.cv5.200.s)
+
+resid.plot <- plot(M.cv5.200.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv5_200_s.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+plot(M.cv5.200.s, id=0.05, idLabels=~.obs)
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv5.200.s,
+                   axis.labels=c("Observation period", "Provisioning rate", "Distance index"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv5_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv5.200.g,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv5_200_s.html"))
+
+
+```
+
+# CV 20 years
+
+```{r CV 20y}
+
+# 20 Y Simple model
+
+# bsdat.cv20.m <- bsdat.cv20.m %>% filter(., BS < 1)
+
+# 100km
+M.cv20.100.s <- glmer(cbind(success, fail)~ LS_SamllB_DistI + LS_SamllB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv20.m, family=binomial)
+summary(M.cv20.100.s)
+
+Anova(M.cv20.100.s, type="III")
+plot(allEffects(M.cv20.100.s), xlab="Proximity", ylab="Breeding success", main=NA, ylim=c(-2.2,2))
+
+
+resid.plot <- plot(M.cv20.100.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv20.100_s.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv20.100.s,
+                 axis.labels=c("Observation period", "Distance index", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv20_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv20.100.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv20_100_s.html"))
+
+
+###
+```
+
+```{r}
+
+# this was code block was added on 20220312 to try get graphs without the big gap between low and high provisioning rates.
+
+effects_ProvisioninR <- effects::effect(term= "LS_SamllB_Total_kg_y", mod= M.cv20.100.s)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv20.m, aes(LS_SamllB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_SamllB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_SamllB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv20_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+###
+effects_DistIinR <- effects::effect(term= "LS_SamllB_DistI", mod= M.cv20.100.s)
+summary(effects_DistIinR) #output of what the values are (is this appropriate for non-linear models?)
+x_DistI <- as.data.frame(effects_DistIinR)
+
+library(ggplot2)
+DistI_plot <- ggplot() +
+geom_point(data=bsdat.cv20.m, aes(LS_SamllB_DistI, BS)) +
+geom_point(data=x_DistI, aes(x=LS_SamllB_DistI, y=fit), color="blue") +
+geom_line(data=x_DistI, aes(x=LS_SamllB_DistI, y=fit), color="blue") +
+geom_ribbon(data= x_DistI, aes(x=LS_SamllB_DistI, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Distance index", y="Breeding success")
+DistI_plot
+
+ggsave("BensonRemove_ObsPer_DistI_effect_cv20_100_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+```
+
+```{r}
+
+# 200km
+
+# Simple model
+M.cv20.200.s <- glmer(cbind(success, fail)~ LS_BigB_DistI + LS_BigB_Total_kg_y + LS_ObservationPeriod + (1|colony)+(1|year), data = bsdat.cv20.m, family=binomial)
+summary(M.cv20.200.s)
+
+resid.plot <- plot(M.cv20.200.s)
+tiff(here::here("Outputs", "Figure_output", "BensonRemove_ObsPer_residuals_M.cv20_200_S.tiff"), units="cm", width=20, height=18, res=300)
+resid.plot 
+dev.off()
+
+
+ # Effects size plots:
+set_theme(base = theme_classic())
+sjPlot::plot_model(M.cv20.200.s,
+                  axis.labels=c("Observation period", "Distance index", "Provisioning rate"),
+show.values=TRUE, show.p=TRUE, vline.color = "grey", transform = NULL, sort.est = TRUE,
+title="") 
+ggsave("BensonRemove_ObsPer_effectsPlot_cv20_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+# Tables:
+
+sjPlot::tab_model(M.cv20.200.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE, 
+pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+dv.labels= "Effects of supplementary feeding sites on vulture breeding success",
+file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_cv20_200_s.html"))
+
+
+###
+
+effects_ProvisioninR <- effects::effect(term= "LS_BigB_Total_kg_y", mod= M.cv20.200.s)
+summary(effects_ProvisioninR) #output of what the values are (is this appropriate for non-linear models?)
+x_ProvR <- as.data.frame(effects_ProvisioninR)
+
+library(ggplot2)
+ProvR_plot <- ggplot() +
+geom_point(data=bsdat.cv20.m, aes(LS_BigB_Total_kg_y, BS)) +
+geom_point(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_line(data=x_ProvR, aes(x=LS_BigB_Total_kg_y, y=fit), color="blue") +
+geom_ribbon(data= x_ProvR, aes(x=LS_BigB_Total_kg_y, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Provisioning rate (logged & scaled)", y="Breeding success")
+ProvR_plot
+ggsave("BensonRemove_ObsPer_ProvR_effect_cv20_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+###
+effects_DistIinR <- effects::effect(term= "LS_BigB_DistI", mod= M.cv20.200.s)
+summary(effects_DistIinR) #output of what the values are (is this appropriate for non-linear models?)
+x_DistI <- as.data.frame(effects_DistIinR)
+
+library(ggplot2)
+DistI_plot <- ggplot() +
+geom_point(data=bsdat.cv20.m, aes(LS_BigB_DistI, BS)) +
+geom_point(data=x_DistI, aes(x=LS_BigB_DistI, y=fit), color="blue") +
+geom_line(data=x_DistI, aes(x=LS_BigB_DistI, y=fit), color="blue") +
+geom_ribbon(data= x_DistI, aes(x=LS_BigB_DistI, ymin=lower, ymax=upper), alpha= 0.3, fill="blue") +
+labs(x="Distance index", y="Breeding success")
+DistI_plot
+
+ggsave("BensonRemove_ObsPer_DistI_effect_cv20_200_s.tiff", path = here::here("Outputs", "Figure_output"))
+
+
+```
+
+
+Model result summaries coalated:
+
+```{r Model result summaries}
+
+#100 km
+
+sjPlot::tab_model(M.cv20.100.s, M.cv10.100.s, M.cv5.100.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+                  pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+                  dv.labels= "Effects of supplementary feeding sites in 100 km buffer on vulture breeding success",
+                  file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_summary_100_s.html")
+                  )
+
+#200 km
+
+sjPlot::tab_model(M.cv20.200.s, M.cv10.200.s, M.cv5.200.s,
+                  transform = NULL,
+                  show.re.var= TRUE,
+                  show.se = TRUE,
+                  pred.labels =c("(Intercept)", "Distance index", "Provisioning rate", "Observation period"),
+                  dv.labels= "Effects of supplementary feeding sites in 200 km buffer on vulture breeding success",
+                  file = here::here("Outputs", "Tables_output", "ModelResults_20210303", "BensonRemove_ObsPer_ModelR_summary_200_s.html")
+                  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+

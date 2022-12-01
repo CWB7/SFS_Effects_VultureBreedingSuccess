@@ -1,0 +1,715 @@
+---
+title: "CV_DataPrep_20201108"
+author: "CWBrink_list"
+date: "08/11/2020"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# The effect of supplementary feeding on Cape Vulture breeding success
+
+Supplementary feeding has become a popular, yet still debated, conservation tool to mitigate Old World vulture declines. This intervention is proposed to support vulture numbers by increasing various demographic parameters but such effects have seldom been verified. I used monitoring data on ten South African Cape Vulture colonies spanning over two decades, to model the relationship between supplementary feeding sites within a 100 or 200 km radius and breeding success. 
+
+This code prepares the data for the above mentioned analysis and entails the creation of the following variables for both the 100 and 200 km buffer:
+
+1) Ammount of food provided inside buffer
+2) Proximity indices per year
+3) Ammount of unsafe food provided (lead and veterianry drugs seperately)
+4) Poisoning probability estimate 
+
+```{r Libraries}
+
+rm(list=ls())
+
+pck <- c("lme4", "tidyverse", "MuMIn", "list", "GGally", "broom", 
+         "caret", "parallel", "mgcv", "gstat", "fasterize", "viridis", "car", 
+         "PerformanceAnalytics", "readr", "sf", "sp", "raster", "spData", 
+         "ggspatial", "here", "xtable", "rgdal", "rgeos", "lwgeom", "ggmap", "raster")
+
+lapply(pck, library, character.only= TRUE)
+
+```
+
+
+```{r Custom functions}
+
+see <- function(x) utils::View(x)
+
+```
+
+```{r Data import}
+
+options(scipen=999)
+
+sfs.dat <- read_csv(here("Data", "SFSDatabase_2020_forChpt4.csv"))
+sfs.dat <- as.data.frame(sfs.dat)
+
+sfs.survey.add <- read.csv(here("Data", "LeadVetD_data_for_addition_toSFSdata_20201116.csv"))
+sfs.survey.add <- as.data.frame(sfs.survey.add)
+
+bs.dat <- read_csv(here("Data", "SummaryData_from_Tapiwa", "Test_data_AWBV.csv"))
+bs.dat <- as.data.frame(bs.dat)
+
+bs.cv <- read_csv(here("Data", "BSdata_checked", "BS_CV_newdata_cwb_20210117.csv"))
+bs.cv <- as.data.frame(bs.cv)
+bs.cv <- dplyr::select(bs.cv, -Notes)
+
+# No coordinates in the summary data, need to do from the start
+bc.dat <- read_csv(here("Data", "SAFRING_106&107_Chick data_accquired20201005.csv"))  
+bc.dat <- as.data.frame(bc.dat)
+
+```
+
+# Data preperation
+
+## Prep
+
+```{r}
+bc.dat <- bc.dat %>% separate(., col = "Location_codeB", into = c("Y", "X"), sep = "S", remove = FALSE)
+bc.dat$X <- lapply(bc.dat$X, gsub, pattern = "E", replacement = "")
+
+#converting to decimal degrees
+
+coord_convert <- function(angle) {
+  angle <- as.character(angle)
+  x <- do.call(rbind, strsplit(angle, split=' '))
+  x <- apply(x, 1L, function(y) {
+    y <- as.numeric(y)
+    y[1] + y[2]/60
+  })
+  return(x)
+}
+
+bc.dat$X <- coord_convert(bc.dat$X)
+bc.dat$Y <- coord_convert(bc.dat$Y)
+bc.dat$Y <- bc.dat$Y*(-1)
+
+```
+
+
+## Filtering
+
+```{r Filtering SFS and adding data}
+
+sfs.dat <- left_join(sfs.dat, sfs.survey.add, by = c("VulPro_Code"="VR_Code"))
+
+sfs.dat <- sfs.dat %>%
+  mutate(Aware_lead = ifelse(Lead == "Yes", 1, ifelse(Lead == "Don't know" | Lead == "No", 0, NA))) %>% 
+  mutate(Aware_drugs = ifelse(Drugs == "Yes", 1, ifelse(Drugs == "Don't know" | Drugs == "No", 0, NA)))
+
+sfs.dat <- sfs.dat %>% dplyr::select(., -c("Province.y", "Lead", "Drugs", "Directions to get there"))
+
+sfs.dat <- sfs.dat %>% filter(., Structure == "SFS") %>% 
+                        filter(., is.na(Closure_date) |Closure_date > 2000) %>% 
+                        filter(., Latitude != "NA" & Longitude != "NA") %>% 
+                        filter(., Status_Category != "Unknown" | Status_Category != "Not SFS") %>% 
+                        filter(., !(Status_Category == "Closed" &  Closure_date < 2000)) 
+                       # filter(., Country == "South Africa" | Country = )
+
+```
+
+```{r Filtering Body Condition}
+
+bc.dat.wbv <- bc.dat %>% filter(., Spp == "107") %>% 
+                      filter(., Age == 1 | Age == 5) %>% # Age 1 = Nestling, Age 5 = 0-6 months
+                      filter(., Mass != "NA") %>% 
+                      filter(., Wing != "NA") %>% 
+                      filter(., Mass > 0) %>% 
+                      filter(., Wing > 0) %>% 
+                      filter(., Cond == 0) %>% 
+                      filter(., Code == 1) %>% 
+                      filter(., Country == "South Africa")
+
+bc.dat.awb <- bc.dat %>% filter(., Spp == "106") %>% 
+                      filter(., Age == 1 | Age == 5) %>% 
+                      filter(., Mass != "NA") %>% 
+                      filter(., Wing != "NA") %>% 
+                      filter(., Mass > 0) %>% 
+                      filter(., Wing > 0) %>% 
+                      filter(., Code == 1)
+
+```
+
+
+## Spatial data and Reprojection
+
+```{r Reprojections}
+
+crs_options = rgdal::make_EPSG() # list of all projections available in R
+#see(crs_options)
+
+crs_utm <-  CRS("+init=epsg:32735") 
+# EPSG:4326 - WGS 84 - Geographic Unit= degrees; EPSG: 32735 WGS 84 UTM35 Projected Unit=meters ~ proj4string of coords
+
+SA <- readRDS(here("Data", "Spatial_data", "SA_baseMaps", "gadm36_ZAF_0_sf.rds"))
+SA = st_transform(SA, 32735)
+Prov <- readRDS(here("Data", "Spatial_data", "SA_baseMaps","gadm36_ZAF_1_sf.rds"))
+Prov = st_transform(Prov, 32735) # transforming to projected CRS WGS84 UTM35S, the number is the EPSG code
+
+Poison <- raster(here("Data", "Spatial_data", "FiveYear_PoisoningPrev_clippedRaster_chpt4.tif"))
+Poison <- projectRaster(Poison, crs = crs(Prov))
+
+crs(Poison)
+
+# st_set_crs()
+# st_crs(Prov)
+
+SFS <-  st_as_sf(sfs.dat, coords = c("Longitude", "Latitude"), crs = 4326)
+SFS = st_transform(SFS, 32735)
+
+bs.dat.sp <- st_as_sf(bs.dat, coords = c("longitude", "latitude"), crs = 4326)
+bs.dat.sp = st_transform(bs.dat.sp, 32735)
+
+bs.cv.sp <- st_as_sf(bs.cv, coords = c("longitude", "latitude"), crs = 4326) 
+bs.cv.sp = st_transform(bs.cv.sp, 32735)
+
+
+bc.dat.wbv <- st_as_sf(bc.dat.wbv, coords = c("X", "Y"), crs = 4326)
+bc.dat.wbv = st_transform(bc.dat.wbv, 32735)
+
+```
+
+# AWB Vultures
+## Buffer
+
+```{r Buffers}
+
+bs.buff100 <- st_buffer(bs.dat.sp, dist = 100000)
+bs.buff200 <- st_buffer(bs.dat.sp, dist = 200000)
+
+```
+
+```{R Maps, eval=FALSE} 
+
+ggplot() +
+  geom_sf(data = Prov) +
+  geom_sf(data = bc.dat.wbv, color = "blue") +
+  geom_sf(data = SFS, color = "green") +
+  geom_sf(data = bs.buff100, fill = "red", alpha = 0.1) +
+  geom_sf(data = bs.dat.sp, color = "black") +
+  geom_sf(data = bs.cv.sp, color = "yellow") +
+  ggtitle("Map of Plot Locations")
+
+ggplot() +
+  geom_sf(data = Prov) +
+  geom_raster(data = Poison_df, aes(x = x, y = y, fill = FiveYear_PoisoningPrev_clippedRaster_chpt4)) + 
+  geom_sf(data = bs.dat.sp) +
+  geom_sf(data = bs.buff100, fill = "blue", alpha = 0.1) +
+  geom_sf(data = SFS, color = "green") +
+  ggtitle("Map of Plot Locations") 
+  
+# plotting raster
+  # convert to a df for plotting in two steps, 1)to SpatialPointsDataFrame 2) to conventional dataframe
+  
+Poison_pts <- rasterToPoints(Poison, spatial = TRUE)
+Poison_df <- data.frame(Poison_pts)
+  
+ggplot() +  
+  geom_raster(data = Poison_df, aes(x = x, y = y, fill = FiveYear_PoisoningPrev_clippedRaster_chpt4))
+
+```
+
+
+# Creating breeding success data set
+
+```{r Exploring components of For Loop, eval=FALSE}
+#################################
+#Doing the filtering outside a loop for single colony, single year.
+#################################
+
+#subset SFS for specific year
+SFS_2012 <- filter(SFS, (Establishment_date < 2012 & Closure_date > 2012) | (Status_Category == "Active" & Establishment_date == "NA"))
+
+# applying to bs data:
+
+# Sequence:
+#1) Selct colony and year
+Buff100_2012MLK <- bs.buff100 %>% filter(., conca == "2012MKL")
+#2) Extract all SFS in buffer of that colony
+SFS_b = SFS[Buff100_2012MLK, ]
+#3) Filter out only SFS active in same year in question
+# - Active with no dates = assume it was active in period
+# - Closed with no dates = assume it was closed in period
+# justification: closed SFS with little data often were never even SFS to start with, ones verrified as active are definately SFS
+SFS_bf <- SFS_b %>% filter(., 
+(Establishment_date < Buff100_2012MLK$year | is.na(Establishment_date)) & (Closure_date > Buff100_2012MLK$year | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)), 
+                        Status_Category != "Unknown", 
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+
+Buff100_2012MLK <- Buff100_2012MLK %>% mutate(., Total_kg_y = sum(SFS_bf$Total_kg_y))
+
+test <- SFS[bs.buff100[20, ], ] # this seems to filter SFS by the colony buffer in question
+```
+
+
+# Creating BREEDING SUCCESS data set
+
+Bat paper formula: Esselstyn et al 2004 "Habitat use of the Pacific sheath-tailed bat (Emballonura semicaudata) on Aguiguan, Mariana Islands". Proximity = (sum((1/distance^2)*food provided))/numberofSFS
+
+```{r 100 km Proximity Index etc}
+
+
+# making lists for the for loops
+# should we be using average in buffer, average of all, average of those active in that year?
+
+ProvBuf <- list()
+
+for(col in unique(bs.buff100$conca)){
+######################################### Spatial filter  
+  buffer = filter(bs.buff100, conca == col)
+  
+  colony_sfs <- filter(SFS,
+    (Establishment_date < buffer$year | is.na(Establishment_date)) & (Closure_date > buffer$year | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+  avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+  
+  colony_sfs_rel = colony_sfs[buffer, ]
+  
+######################################## SFS number and Total Provisioning  
+  SFS_noPR_number <- colony_sfs_rel %>% filter(., is.na(Total_kg_y)) %>% nrow(.)
+  SFS_number <- nrow(colony_sfs_rel)
+  
+  colony_sfs_rel <- colony_sfs_rel %>% mutate_at(vars("Total_kg_y"), ~replace(., is.na(.), avg_pr)) # adding average ProvR to SFS without any
+  
+  Food <- sum(colony_sfs_rel$Total_kg_y) 
+  
+  Lead_food <- colony_sfs_rel %>% filter(., Aware_lead == 0)
+  Lead_food <- sum(Lead_food$Game_kg_y)
+  Lead_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_lead)) %>% nrow()
+  
+  Drugs_food <- colony_sfs_rel %>% filter(., Aware_drugs == 0) 
+  Drugs_food <- sum(Drugs_food$Total_kg_y - Drugs_food$Game_kg_y)
+  Drugs_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_drugs)) %>% nrow()
+  
+##################################### Poisoning Probability
+  
+AvgPoison <- as.vector(extract(Poison, buffer, fun = mean, na.rm = TRUE))
+
+b_code <- col
+  
+########################################## Proximity Index  
+ProxIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.dat.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v1 <- (1/(st_distance(VR, colony.point))^2)*VR$Total_kg_y
+    
+    ProxIndex[[sfs]] <- v1
+  }
+  PI_step1 <- as.data.frame(do.call(rbind, ProxIndex))
+  PI <- sum(PI_step1)/nrow(colony_sfs_rel)
+  
+###########################################
+  ProvBuf[[col]] <- c(b_code, SFS_number, SFS_noPR_number, PI, Food, Lead_food, Drugs_food, Lead_answered, Drugs_answered, AvgPoison)
+}
+
+Results.bs.100 <- as.data.frame(do.call(rbind,  ProvBuf))
+Results.bs.100 <- rename(Results.bs.100, b_code = V1, SamllB_SFS_number = V2, SamllB_SFS_noPR_number = V3, SamllB_PI  = V4, SamllB_Total_kg_y = V5, SamllB_Lead_foodkgy = V6, SamllB_Drugs_foodkgy = V7, SamllB_Lead_answered = V8, SamllB_Drugs_answered = V9, SamllB_AvgPoison = V10)
+
+bs.dat2 <- left_join(bs.dat, Results.bs.100, by = c("conca"="b_code"))
+
+```
+
+```{r 200 km Proximity Index etc}
+
+ProvBuf <- list()
+
+for(col in unique(bs.buff200$conca)){
+######################################### Spatial filter  
+  buffer = filter(bs.buff200, conca == col)
+  
+  colony_sfs <- filter(SFS,
+    (Establishment_date < buffer$year | is.na(Establishment_date)) & (Closure_date > buffer$year | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+  avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+  
+  colony_sfs_rel = colony_sfs[buffer, ]
+  
+######################################## SFS number and Total Provisioning  
+  SFS_noPR_number <- colony_sfs_rel %>% filter(., is.na(Total_kg_y)) %>% nrow(.)
+  SFS_number <- nrow(colony_sfs_rel)
+  
+  colony_sfs_rel <- colony_sfs_rel %>% mutate_at(vars("Total_kg_y"), ~replace(., is.na(.), avg_pr)) # adding average ProvR to SFS without any
+  
+  Food <- sum(colony_sfs_rel$Total_kg_y) 
+  
+  Lead_food <- colony_sfs_rel %>% filter(., Aware_lead == 0)
+  Lead_food <- sum(Lead_food$Game_kg_y)
+  Lead_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_lead)) %>% nrow()
+  
+  Drugs_food <- colony_sfs_rel %>% filter(., Aware_drugs == 0) 
+  Drugs_food <- sum(Drugs_food$Total_kg_y - Drugs_food$Game_kg_y)
+  Drugs_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_drugs)) %>% nrow()
+  
+##################################### Poisoning Probability
+  
+  AvgPoison <- as.vector(extract(Poison, buffer, fun = mean, na.rm = TRUE))
+
+  b_code <- col
+  
+########################################## Proximity Index  
+ProxIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.dat.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v1 <- (1/(st_distance(VR, colony.point))^2)*VR$Total_kg_y
+    
+    ProxIndex[[sfs]] <- v1
+  }
+  PI_step1 <- as.data.frame(do.call(rbind, ProxIndex))
+  PI <- sum(PI_step1)/nrow(colony_sfs_rel)
+  
+###########################################
+  ProvBuf[[col]] <- c(b_code, SFS_number, SFS_noPR_number, PI, Food, Lead_food, Drugs_food, Lead_answered, Drugs_answered, AvgPoison)
+}
+
+Results.bs.200 <- as.data.frame(do.call(rbind,  ProvBuf))
+Results.bs.200 <- rename(Results.bs.200, b_code = V1, BigB_SFS_number = V2, BigB_SFS_noPR_number = V3, BigB_PI  = V4, BigB_Total_kg_y = V5, BigB_Lead_foodkgy = V6, BigB_Drugs_foodkgy = V7, BigB_Lead_answered = V8, BigB_Drugs_answered = V9, BigB_AvgPoison = V10)
+
+bs.dat2 <- left_join(bs.dat2, Results.bs.200, by = c("conca"="b_code"))
+
+write.csv(bs.dat2, here("Outputs", "Data_output", "BreedingSuccess_PI.csv"))
+
+```
+
+```{r Double checking Results for individual buffers, eval=FALSE}
+
+
+sfs.test <- filter(SFS,
+    (Establishment_date < 2015 | is.na(Establishment_date)) & (Closure_date > 2015 | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+
+buf.test <-  bs.buff100 %>% filter(., conca == "2015BNM")
+
+t = sfs.test[buf.test, ]
+
+ggplot() +
+  geom_sf(data = Prov) +
+  geom_sf(data = sfs.test, color = "black") +
+ # geom_sf(data = bs.dat.sp) +
+  geom_sf(data = buf.test, fill = "blue", alpha = 0.05) +
+  ggtitle("Map of Plot Locations")
+
+```
+
+## Test Prox Index
+
+Below I test Proximity Index calculations and see if my loop results match those done by hand. The loop seems to be working correctly.
+
+```{r Testing PI by hand, eval=FALSE}
+
+# 2017VLK
+buf.test <- filter(bs.buff100, conca == "2017VLK")
+col.point.test <-  filter(bs.dat.sp, conca == "2017VLK")
+
+colony_sfs <- filter(SFS,
+    (Establishment_date < 2017 | is.na(Establishment_date)) & (Closure_date > 2017 | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+
+
+colony_sfs_test = colony_sfs[buf.test, ]
+
+st_distance(colony_sfs_test, col.point.test)
+
+
+
+q <- ((1/(51495.30)^2)*33750) + ((1/(69916.31)^2)*7076.441) + ((1/(21758.42)^2)*18676.408) + ((1/(71953.47)^2)*3600) + ((1/(49146.49)^2)*1000)
+
+q/5 # 0.00001094672 Same as loop
+    # 0.0000109467209782848
+
+# 2011MKL
+
+buf.test <- filter(bs.buff100, conca == "2011MKL")
+col.point.test <-  filter(bs.dat.sp, conca == "2011MKL")
+
+colony_sfs <- filter(SFS,
+    (Establishment_date < 2011 | is.na(Establishment_date)) & (Closure_date > 2011 | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+
+
+colony_sfs_test = colony_sfs[buf.test, ]
+
+st_distance(colony_sfs_test, col.point.test)
+
+
+
+q <- ((1/(58862.95)^2)*6491.525) + ((1/(55281.05)^2)*1080) 
+  
+q/2 # 0.000001113471
+    # 0.00000111347118096256 (same as my loop)
+
+
+# 2015BNM
+
+buf.test <- filter(bs.buff100, conca == "2015BNM")
+col.point.test <-  filter(bs.dat.sp, conca == "2015BNM")
+
+colony_sfs <- filter(SFS,
+    (Establishment_date < 2015 | is.na(Establishment_date)) & (Closure_date > 2015 | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+
+
+colony_sfs_test = colony_sfs[buf.test, ]
+
+st_distance(colony_sfs_test, col.point.test) #~ not working
+
+
+
+q <- ((1/(21516.005)^2)*4666.681) + ((1/(46958.962)^2)*28731.146) + ((1/(93181.367)^2)*18991.99) + ((1/(18465.364)^2)*3000.000) + ((1/(6444.059)^2)*18991.99) + ((1/(8120.428)^2)*8800.000)
+  
+q/6 # 0.0001041501     (Same as loop)
+    # 0.000104150060299384
+
+```
+
+
+# Cape Vultures
+
+## Buffer
+
+```{r Buffers}
+
+bs.cv.b100 <- st_buffer(bs.cv.sp, dist = 100000)
+bs.cv.b200 <- st_buffer(bs.cv.sp, dist = 200000)
+
+```
+
+```{R Maps} 
+
+ggplot() +
+  geom_sf(data = Prov) +
+  geom_sf(data = bs.cv.sp, color = "blue") +
+  geom_sf(data = filter(SFS, Country == "South Africa"), color = "green") +
+  geom_sf(data = bs.cv.b200, fill = "blue", alpha = 0.01) +
+  geom_sf(data = bs.cv.b100, fill = "red", alpha = 0.01) +
+  #geom_sf(data = bs.dat.sp, color = "black") +
+  ggtitle("Map of Plot Locations")
+
+```
+
+# Creating CV BREEDING SUCCESS data set
+
+bat paper formula: Esselstyn et al 2004 "Habitat use of the Pacific sheath-tailed bat (Emballonura semicaudata) on Aguiguan, Mariana Islands". Proximity = (sum((1/distance^2)*food provided))/numberofSFS
+
+```{r CV 100 km Proximity Index etc}
+
+ProvBuf <- list()
+
+for(col in unique(bs.cv.b100$conca)){
+######################################### Spatial filter  
+  buffer = filter(bs.cv.b100, conca == col)
+  
+  colony_sfs <- filter(SFS,
+    (Establishment_date < buffer$year | is.na(Establishment_date)) & (Closure_date > buffer$year | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+  avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+  
+  colony_sfs_rel = colony_sfs[buffer, ]
+  
+######################################## SFS number and Total Provisioning  
+  SFS_noPR_number <- colony_sfs_rel %>% filter(., is.na(Total_kg_y)) %>% nrow(.)
+  SFS_number <- nrow(colony_sfs_rel)
+  
+  colony_sfs_rel <- colony_sfs_rel %>% mutate_at(vars("Total_kg_y"), ~replace(., is.na(.), avg_pr)) # adding average ProvR to SFS without any
+  
+  Food <- sum(colony_sfs_rel$Total_kg_y) 
+  
+  Lead_food <- colony_sfs_rel %>% filter(., Aware_lead == 0)
+  Lead_food <- sum(Lead_food$Game_kg_y)
+  Lead_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_lead)) %>% nrow()
+  
+  Drugs_food <- colony_sfs_rel %>% filter(., Aware_drugs == 0) 
+  Drugs_food <- sum(Drugs_food$Total_kg_y - Drugs_food$Game_kg_y)
+  Drugs_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_drugs)) %>% nrow()
+  
+  ##################################### Poisoning Probability
+  
+  AvgPoison <- as.vector(extract(Poison, buffer, fun = mean, na.rm = TRUE))
+
+  b_code <- col
+  
+########################################## Proximity Index  
+ProxIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.cv.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v1 <- (1/(st_distance(VR, colony.point))^2)*VR$Total_kg_y
+    
+    ProxIndex[[sfs]] <- v1
+  }
+  PI_step1 <- as.data.frame(do.call(rbind, ProxIndex))
+  PI <- sum(PI_step1)/nrow(colony_sfs_rel)
+    
+########################################## Distance Index  
+DistIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.cv.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v2 <- (1/(st_distance(VR, colony.point))^2)
+    
+    DistIndex[[sfs]] <- v2
+  }
+  DistI_step1 <- as.data.frame(do.call(rbind, DistIndex))
+  DistI <- sum(DistI_step1)/nrow(colony_sfs_rel)
+  
+###########################################
+  ProvBuf[[col]] <- c(b_code, SFS_number, SFS_noPR_number, PI, Food, Lead_food, Drugs_food, Lead_answered, Drugs_answered, AvgPoison, DistI)
+}
+
+Results.cv.bs100 <- as.data.frame(do.call(rbind,  ProvBuf))
+Results.cv.bs100 <- rename(Results.cv.bs100, b_code = V1, SamllB_SFS_number = V2, SamllB_SFS_noPR_number = V3, SamllB_PI  = V4, SamllB_Total_kg_y = V5, SamllB_Lead_foodkgy = V6, SamllB_Drugs_foodkgy = V7, SamllB_Lead_answered = V8, SamllB_Drugs_answered = V9, SamllB_AvgPoison = V10, SamllB_DistI = V11)
+
+bs.cv2 <- left_join(bs.cv, Results.cv.bs100, by = c("conca"="b_code"))
+
+```
+
+```{r CV 200 km Proximity Index etc}
+
+ProvBuf <- list()
+
+for(col in unique(bs.cv.b200$conca)){
+######################################### Spatial filter  
+  buffer = filter(bs.cv.b200, conca == col)
+  
+  colony_sfs <- filter(SFS,
+    (Establishment_date < buffer$year | is.na(Establishment_date)) & (Closure_date > buffer$year | is.na(Closure_date))|
+                          (Status_Category == "Active" & is.na(Establishment_date) & is.na(Closure_date)),
+                        Status_Category != "Unknown",
+                        !(Status_Category == "Closed" & is.na(Establishment_date) & is.na(Closure_date)))
+  
+  avg_pr <- mean(colony_sfs$Total_kg_y, na.rm = T) 
+  
+  colony_sfs_rel = colony_sfs[buffer, ]
+  
+######################################## SFS number and Total Provisioning  
+  SFS_noPR_number <- colony_sfs_rel %>% filter(., is.na(Total_kg_y)) %>% nrow(.)
+  SFS_number <- nrow(colony_sfs_rel)
+  
+  colony_sfs_rel <- colony_sfs_rel %>% mutate_at(vars("Total_kg_y"), ~replace(., is.na(.), avg_pr)) # adding average ProvR to SFS without any
+  
+  Food <- sum(colony_sfs_rel$Total_kg_y) 
+  
+  Lead_food <- colony_sfs_rel %>% filter(., Aware_lead == 0)
+  Lead_food <- sum(Lead_food$Game_kg_y)
+  Lead_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_lead)) %>% nrow()
+  
+  Drugs_food <- colony_sfs_rel %>% filter(., Aware_drugs == 0) 
+  Drugs_food <- sum(Drugs_food$Total_kg_y - Drugs_food$Game_kg_y)
+  Drugs_answered <- colony_sfs_rel %>% filter(., !is.na(Aware_drugs)) %>% nrow()
+  
+  ##################################### Poisoning Probability
+  
+  AvgPoison <- as.vector(extract(Poison, buffer, fun = mean, na.rm = TRUE))
+
+  b_code <- col
+  
+########################################## Proximity Index  
+ProxIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.cv.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v1 <- (1/(st_distance(VR, colony.point))^2)*VR$Total_kg_y
+    
+    ProxIndex[[sfs]] <- v1
+  }
+  PI_step1 <- as.data.frame(do.call(rbind, ProxIndex))
+  PI <- sum(PI_step1)/nrow(colony_sfs_rel)
+  
+########################################## Dist Index  
+DistIndex <- list() 
+  
+for(sfs in unique(colony_sfs_rel$SFS_Code)){
+  
+    VR <- filter(colony_sfs_rel, SFS_Code == sfs)
+    
+    colony.point <- filter(bs.cv.sp, conca == b_code)  # b_code doesnt change - keeps same b_code throughout loop
+    
+    v2 <- (1/(st_distance(VR, colony.point))^2)
+    
+    DistIndex[[sfs]] <- v2
+  }
+  DistI_step1 <- as.data.frame(do.call(rbind, DistIndex))
+  DistI <- sum(DistI_step1)/nrow(colony_sfs_rel)
+  
+###########################################
+  
+  ProvBuf[[col]] <- c(b_code, SFS_number, SFS_noPR_number, PI, Food, Lead_food, Drugs_food, Lead_answered, Drugs_answered, AvgPoison, DistI)
+}
+
+Results.cv.bs200 <- as.data.frame(do.call(rbind,  ProvBuf))
+Results.cv.bs200 <- rename(Results.cv.bs200, b_code = V1, BigB_SFS_number = V2, BigB_SFS_noPR_number = V3, BigB_PI  = V4, BigB_Total_kg_y = V5, BigB_Lead_foodkgy = V6, BigB_Drugs_foodkgy = V7, BigB_Lead_answered = V8, BigB_Drugs_answered = V9, BigB_AvgPoison = V10, BigB_DistI = V11)
+
+bs.cv2 <- left_join(bs.cv2, Results.cv.bs200, by = c("conca"="b_code"))
+
+write.csv(bs.cv2, here("Outputs", "Data_output", "BreedingSuccess_CV_PI_20210131.csv"))
+
+```
+
+```{r}
+
+bs.dat2 <- bs.dat2 %>% 
+  mutate_at(vars(starts_with("SamllB_")), funs(as.numeric)) %>% 
+  mutate_at(vars(starts_with("BigB_")), funs(as.numeric)) %>% 
+  mutate_at(vars("proxi100", "vr100"), funs(as.numeric))
+
+bs.cv2 <- bs.cv2 %>% 
+  mutate_at(vars(starts_with("SamllB_")), funs(as.numeric)) %>% 
+  mutate_at(vars(starts_with("BigB_")), funs(as.numeric))
+
+Results <- bind_rows(bs.dat2, bs.cv2)
+
+Results <- Results %>% dplyr::select(-c("FID", "Active", "ob"))
+
+write.csv(Results, here("Outputs", "Data_output", "BreedingSuccess_all_results.csv"))
+
+```
+
+
